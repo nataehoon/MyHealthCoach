@@ -1,11 +1,15 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from typing import List, Optional
+from sqlalchemy import create_engine, text
+import os
 
 # 랭체인 및 Ollama 관련 라이브러리
 from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_community.vectorstores import PGVector
 from langchain_core.documents import Document
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 app = FastAPI(title="MyHealthCoach")
 
@@ -34,13 +38,59 @@ class ChatRequest(BaseModel):
 def read_root():
     return {"status":"running", "message":"MyHealthCoach 서버가 준비되었습니다."}
 
-@app.post("/add-knowledge")
-async def add_knowledge(data: KnowledgeInput):
+UPLOAD_DIR = "./static/pdfs"
+if not os.path.exists(UPLOAD_DIR):
+    os.makedirs(UPLOAD_DIR)
+
+@app.post("/upload-pdf")
+async def upload_pdf(file: UploadFile = File(...)):
     try:
-        doc = Document(page_content=data.content, metadata={"source":data.source})
-        vector_store.add_documents([doc])
-        return {"message": f"'{data.source}' 내용이 성공적으로 저장되었습니다."}
+        # 파일 저장
+        file_content = await file.read()
+        file_size = len(file_content)
+        file_path = os.path.join(UPLOAD_DIR, file.filename) 
+        with open(file_path, "wb") as buffer:
+            buffer.write(file_content)
+        
+        # 파일 정보 기록
+        engine = create_engine(CONNECTION_STRING)
+        with engine.connect() as conn:
+            query = text("INSERT INTO uploaded_files(filename, file_path, file_size) VALUES(:filename, :path, :size)")
+            conn.execute(query, {
+                "filename": file.filename,
+                "path": file_path,
+                "size": file_size
+            })
+            conn.commit()
+
+        print("DB 저장 성공")
+
+        # PDF 로드 및 텍스트 추출
+        loader = PyPDFLoader(file_path)
+        pages = loader.load()
+        print("텍스트 추출")
+
+        # 텍스트 쪼개기(chunking)
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=600,
+            chunk_overlap=100
+        )
+        splits = text_splitter.split_documents(pages)
+        print("텍스트 쪼개기")
+
+        # 출처 정보를 메타데이터에 추가
+        for split in splits:
+            split.metadata["source"] = file.filename
+        print("메타 데이터 저장")
+        
+        vector_store.add_documents(sanitize_docs(splits)) 
+        print("벡터 DB 저장")
+        
+        return {"status": "success", "chunks_saved": len(splits), "message": f"'{file.filename}' 파일 분석 및 벡터 DB 저장 완료!"}
     except Exception as e:
+        # 실패할 경우 파일 삭제
+        if os.path.exists(file_path):
+            os.remove(file_path)
         raise HTTPException(status_code=500, detail=str(e))
     
 @app.post("/ask")
@@ -71,3 +121,13 @@ async def ask_question(request: ChatRequest):
         "answer": response.content,
         "sources": [d.metadata["source"] for d in docs]
     }
+
+def sanitize_docs(docs):
+    for doc in docs:
+        doc.page_content = doc.page_content.encode('utf-8', 'ignore').replace(b'\x00', b'').decode('utf-8')
+        doc.metadata = {k: (v.encode('utf-8', 'ignore').replace(b'\x00', b'').decode('utf-8') if isinstance(v, str) else v) 
+                        for k, v in doc.metadata.items()}
+    return docs
+
+from fastapi.staticfiles import StaticFiles
+app.mount("/static", StaticFiles(directory="static"), name="static")

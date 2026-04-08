@@ -8,3 +8,9 @@ __pycache__/
 # 운영체제 임시 파일 (선택사항)
 .DS_Store
 Thumbs.db
+
+# VSCode
+.vscode
+
+# 첨부파일
+static/pdfs/*
